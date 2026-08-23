@@ -8,7 +8,14 @@ fn main() {
     cfg_aliases! {
         // Systems.
         android_platform: { target_os = "android" },
-        web_platform: { all(target_family = "wasm", target_os = "unknown") },
+        // wasm32-unknown-emscripten also uses winit's web backend: it's
+        // still a browser wasm-bindgen/web-sys target like
+        // wasm32-unknown-unknown, just with libc/Emscripten runtime
+        // support alongside (needed to statically link against a
+        // non-Rust codebase sharing the same linear memory). `free_unix`
+        // below deliberately excludes target_os = "emscripten" so this
+        // is its only platform_impl match.
+        web_platform: { all(target_family = "wasm", any(target_os = "unknown", target_os = "emscripten")) },
         macos_platform: { target_os = "macos" },
         ios_platform: { target_os = "ios" },
         windows_platform: { target_os = "windows" },
