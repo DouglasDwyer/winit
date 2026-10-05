@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
 use std::num::{NonZeroU16, NonZeroU32};
@@ -5,18 +6,19 @@ use std::{io, iter, mem, ptr};
 
 use dpi::{PhysicalPosition, PhysicalSize};
 use windows_sys::Win32::Devices::Display::{
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
-    QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO,
+    DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_PIXELFORMAT_8BPP,
+    DISPLAYCONFIG_PIXELFORMAT_16BPP, DISPLAYCONFIG_PIXELFORMAT_24BPP,
+    DISPLAYCONFIG_PIXELFORMAT_32BPP, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
+    GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, POINT, RECT,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    DEVMODEW, DM_BITSPERPEL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
-    ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsExW, GetMonitorInfoW, HDC,
-    HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW,
-    MonitorFromPoint, MonitorFromWindow,
+    DEVMODEW, DM_BITSPERPEL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, EnumDisplayMonitors,
+    EnumDisplaySettingsExW, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint, MonitorFromWindow,
 };
 use windows_sys::core::BOOL;
 use winit_core::monitor::{MonitorHandleProvider, VideoMode};
@@ -53,13 +55,7 @@ impl std::fmt::Debug for VideoModeHandle {
 }
 
 impl VideoModeHandle {
-    /// Create a handle from a `DEVMODEW`.
-    ///
-    /// `DEVMODEW` only carries the refresh rate rounded to whole hertz. If a more precise rate is
-    /// known (see [`query_refresh_rate_millihertz`]), pass it as `refresh_rate_millihertz` to
-    /// use it for the public [`VideoMode`] instead. The `DEVMODEW` is kept as-is, since that is
-    /// what must be handed back to the system when changing display settings.
-    fn new(native_video_mode: DEVMODEW, refresh_rate_millihertz: Option<NonZeroU32>) -> Self {
+    fn new(native_video_mode: DEVMODEW) -> Self {
         const REQUIRED_FIELDS: u32 =
             DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
         assert!(has_flag(native_video_mode.dmFields, REQUIRED_FIELDS));
@@ -67,99 +63,137 @@ impl VideoModeHandle {
         let mode = VideoMode::new(
             (native_video_mode.dmPelsWidth, native_video_mode.dmPelsHeight).into(),
             NonZeroU16::new(native_video_mode.dmBitsPerPel as u16),
-            refresh_rate_millihertz
-                .or_else(|| NonZeroU32::new(native_video_mode.dmDisplayFrequency * 1000)),
+            NonZeroU32::new(native_video_mode.dmDisplayFrequency * 1000),
         );
 
         VideoModeHandle { mode, native_video_mode: Box::new(native_video_mode) }
     }
 }
 
-/// Query the exact refresh rate, in millihertz, that the display with the given GDI device name
-/// (e.g. `\\.\DISPLAY1`, see `szDevice` in [`MONITORINFOEXW`]) is currently running at.
+thread_local! {
+    // Scratch buffers for `query_current_video_mode`, kept around to avoid allocating on every
+    // query.
+    static DISPLAY_CONFIG_BUFFERS: RefCell<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)> =
+        const { RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Query the video mode that the display with the given GDI device name (e.g. `\\.\DISPLAY1`,
+/// see `szDevice` in [`MONITORINFOEXW`]) is currently running in.
 ///
 /// This uses `QueryDisplayConfig`, which reports the refresh rate as a rational number, unlike
-/// `EnumDisplaySettingsExW`, which rounds it to whole hertz (so 59.94 Hz shows up as 60 Hz).
+/// `EnumDisplaySettingsExW`, which only knows whole hertz (so 59.94 Hz shows up as 60 Hz).
 ///
-/// Returns `None` if the display isn't part of an active path, or no rate is reported.
-fn query_refresh_rate_millihertz(gdi_device_name: &[u16]) -> Option<NonZeroU32> {
-    let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> = Vec::new();
-    let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> = Vec::new();
+/// Returns `None` if the display isn't part of an active path (e.g. because it was disconnected
+/// in the meantime), or the system doesn't report a source mode for it.
+fn query_current_video_mode(gdi_device_name: &[u16]) -> Option<VideoMode> {
+    // `modeInfoIdx` value for a path that has no mode information.
+    const MODE_IDX_INVALID: u32 = 0xffff_ffff;
 
-    // The configuration can change between getting the buffer sizes and querying it, in which
-    // case `QueryDisplayConfig` fails with `ERROR_INSUFFICIENT_BUFFER` and we have to retry.
-    loop {
-        let (mut num_paths, mut num_modes) = (0u32, 0u32);
-        let status = unsafe {
-            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut num_paths, &mut num_modes)
-        };
-        if status != ERROR_SUCCESS {
-            tracing::warn!("Error from GetDisplayConfigBufferSizes: {status}");
-            return None;
-        }
-
-        paths.clear();
-        paths.resize_with(num_paths as usize, || unsafe { mem::zeroed() });
-        modes.clear();
-        modes.resize_with(num_modes as usize, || unsafe { mem::zeroed() });
-
-        let status = unsafe {
-            QueryDisplayConfig(
-                QDC_ONLY_ACTIVE_PATHS,
-                &mut num_paths,
-                paths.as_mut_ptr(),
-                &mut num_modes,
-                modes.as_mut_ptr(),
-                ptr::null_mut(),
-            )
-        };
-        match status {
-            ERROR_SUCCESS => {
-                paths.truncate(num_paths as usize);
-                break;
-            },
-            ERROR_INSUFFICIENT_BUFFER => continue,
-            status => {
-                tracing::warn!("Error from QueryDisplayConfig: {status}");
+    DISPLAY_CONFIG_BUFFERS.with_borrow_mut(|(paths, modes)| {
+        // The configuration can change between getting the buffer sizes and querying it, in which
+        // case `QueryDisplayConfig` fails with `ERROR_INSUFFICIENT_BUFFER` and we have to retry.
+        loop {
+            let (mut num_paths, mut num_modes) = (0u32, 0u32);
+            let status = unsafe {
+                GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut num_paths, &mut num_modes)
+            };
+            if status != ERROR_SUCCESS {
+                tracing::warn!("Error from GetDisplayConfigBufferSizes: {status}");
                 return None;
-            },
-        }
-    }
+            }
 
-    let wanted_name = gdi_device_name.split(|&c| c == 0).next().unwrap_or_default();
-    paths.iter().find_map(|path| {
-        // Find the path whose source corresponds to the GDI device (i.e. the monitor).
-        let mut source_name: DISPLAYCONFIG_SOURCE_DEVICE_NAME = unsafe { mem::zeroed() };
-        source_name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        source_name.header.size = mem::size_of_val(&source_name) as u32;
-        source_name.header.adapterId = path.sourceInfo.adapterId;
-        source_name.header.id = path.sourceInfo.id;
-        // This function returns a (non-`WIN32_ERROR`) `LONG`, where 0 is `ERROR_SUCCESS`.
-        if unsafe { DisplayConfigGetDeviceInfo(&mut source_name.header) } != 0 {
+            paths.resize(num_paths as usize, DISPLAYCONFIG_PATH_INFO::default());
+            modes.resize(num_modes as usize, DISPLAYCONFIG_MODE_INFO::default());
+
+            let status = unsafe {
+                QueryDisplayConfig(
+                    QDC_ONLY_ACTIVE_PATHS,
+                    &mut num_paths,
+                    paths.as_mut_ptr(),
+                    &mut num_modes,
+                    modes.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            match status {
+                ERROR_SUCCESS => {
+                    paths.truncate(num_paths as usize);
+                    modes.truncate(num_modes as usize);
+                    break;
+                },
+                ERROR_INSUFFICIENT_BUFFER => continue,
+                status => {
+                    tracing::warn!("Error from QueryDisplayConfig: {status}");
+                    return None;
+                },
+            }
+        }
+
+        let wanted_name = gdi_device_name.split(|&c| c == 0).next().unwrap_or_default();
+        let path = paths.iter().find(|path| {
+            // Find the path whose source corresponds to the GDI device (i.e. the monitor).
+            let mut source_name = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            source_name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            source_name.header.size = mem::size_of_val(&source_name) as u32;
+            source_name.header.adapterId = path.sourceInfo.adapterId;
+            source_name.header.id = path.sourceInfo.id;
+            // This returns a plain `i32` rather than a `WIN32_ERROR`, but 0 is still success.
+            if unsafe { DisplayConfigGetDeviceInfo(&mut source_name.header) } != 0 {
+                return false;
+            }
+            let name = source_name.viewGdiDeviceName.split(|&c| c == 0).next();
+            name.unwrap_or_default() == wanted_name
+        })?;
+
+        // The source mode holds the size and pixel format of the desktop on this display. We don't
+        // pass `QDC_VIRTUAL_MODE_AWARE`, so `modeInfoIdx` is a plain index into `modes`.
+        let mode_idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+        let mode_info =
+            modes.get(usize::try_from(mode_idx).ok()?).filter(|_| mode_idx != MODE_IDX_INVALID)?;
+        if mode_info.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
             return None;
         }
-        let name = source_name.viewGdiDeviceName.split(|&c| c == 0).next().unwrap_or_default();
-        if name != wanted_name {
-            return None;
-        }
+        let source_mode = unsafe { mode_info.Anonymous.sourceMode };
+
+        let bit_depth = match source_mode.pixelFormat {
+            DISPLAYCONFIG_PIXELFORMAT_8BPP => NonZeroU16::new(8),
+            DISPLAYCONFIG_PIXELFORMAT_16BPP => NonZeroU16::new(16),
+            DISPLAYCONFIG_PIXELFORMAT_24BPP => NonZeroU16::new(24),
+            DISPLAYCONFIG_PIXELFORMAT_32BPP => NonZeroU16::new(32),
+            _ => None,
+        };
 
         let rate = path.targetInfo.refreshRate;
-        if rate.Denominator == 0 {
-            return None;
-        }
-        // Round to the nearest millihertz.
-        let millihertz = (u64::from(rate.Numerator) * 1000 + u64::from(rate.Denominator) / 2)
-            / u64::from(rate.Denominator);
-        NonZeroU32::new(u32::try_from(millihertz).ok()?)
+        let refresh_rate_millihertz = (rate.Denominator != 0)
+            .then(|| {
+                // Round to the nearest millihertz.
+                let millihertz = (u64::from(rate.Numerator) * 1000
+                    + u64::from(rate.Denominator) / 2)
+                    / u64::from(rate.Denominator);
+                NonZeroU32::new(u32::try_from(millihertz).ok()?)
+            })
+            .flatten();
+
+        Some(VideoMode::new(
+            PhysicalSize::new(source_mode.width, source_mode.height),
+            bit_depth,
+            refresh_rate_millihertz,
+        ))
     })
 }
 
-/// Whether two `DEVMODEW`s describe the same size, bit depth and (rounded) refresh rate.
-fn is_same_mode(a: &DEVMODEW, b: &DEVMODEW) -> bool {
-    a.dmPelsWidth == b.dmPelsWidth
-        && a.dmPelsHeight == b.dmPelsHeight
-        && a.dmBitsPerPel == b.dmBitsPerPel
-        && a.dmDisplayFrequency == b.dmDisplayFrequency
+/// Whether `mode`, as enumerated by `EnumDisplaySettingsExW` (and thus with a rounded refresh
+/// rate), describes the same mode as `current`, which has the exact refresh rate.
+fn is_current_mode(mode: &VideoMode, current: &VideoMode) -> bool {
+    // Be lenient about the rounding (up, down or to nearest) that the driver applied.
+    let same_refresh_rate =
+        match (mode.refresh_rate_millihertz(), current.refresh_rate_millihertz()) {
+            (Some(mode), Some(current)) => mode.get().abs_diff(current.get()) < 1000,
+            (mode, current) => mode == current,
+        };
+    mode.size() == current.size()
+        && (current.bit_depth().is_none() || mode.bit_depth() == current.bit_depth())
+        && same_refresh_rate
 }
 
 unsafe extern "system" fn monitor_enum_proc(
@@ -253,19 +287,9 @@ impl MonitorHandle {
 
         let device_name = monitor_info.szDevice.as_ptr();
 
-        // `EnumDisplaySettingsExW` only knows whole hertz. Get the exact rate of the mode that's
-        // currently active, and use that for the entry describing that mode.
-        let current = unsafe {
-            let mut mode: DEVMODEW = mem::zeroed();
-            mode.dmSize = mem::size_of_val(&mode) as u16;
-            (EnumDisplaySettingsExW(device_name, ENUM_CURRENT_SETTINGS, &mut mode, 0)
-                != false.into())
-            .then_some(mode)
-        };
-        let current_refresh_rate = current
-            .is_some()
-            .then(|| query_refresh_rate_millihertz(&monitor_info.szDevice))
-            .flatten();
+        // `EnumDisplaySettingsExW` only knows whole hertz. Use the exact refresh rate for the
+        // entry that describes the mode that's currently active.
+        let current = query_current_video_mode(&monitor_info.szDevice);
 
         let mut i = 0;
         loop {
@@ -275,13 +299,14 @@ impl MonitorHandle {
                 break;
             }
 
-            let refresh_rate = current
-                .as_ref()
-                .filter(|current| is_same_mode(current, &mode))
-                .and(current_refresh_rate);
+            let mut handle = VideoModeHandle::new(mode);
+            if let Some(current) = current.filter(|current| is_current_mode(&handle.mode, current))
+            {
+                handle.mode = current;
+            }
 
             // Use Ord impl of RootVideoModeHandle
-            modes.insert(VideoModeHandle::new(mode, refresh_rate));
+            modes.insert(handle);
 
             i += 1;
         }
@@ -319,19 +344,7 @@ impl MonitorHandleProvider for MonitorHandle {
 
     fn current_video_mode(&self) -> Option<winit_core::monitor::VideoMode> {
         let monitor_info = get_monitor_info(self.0).ok()?;
-        let device_name = monitor_info.szDevice.as_ptr();
-        let mode = unsafe {
-            let mut mode: DEVMODEW = mem::zeroed();
-            mode.dmSize = mem::size_of_val(&mode) as u16;
-            if EnumDisplaySettingsExW(device_name, ENUM_CURRENT_SETTINGS, &mut mode, 0)
-                == false.into()
-            {
-                return None;
-            }
-            mode
-        };
-        let refresh_rate = query_refresh_rate_millihertz(&monitor_info.szDevice);
-        Some(VideoModeHandle::new(mode, refresh_rate).mode)
+        query_current_video_mode(&monitor_info.szDevice)
     }
 
     fn video_modes(&self) -> Box<dyn Iterator<Item = VideoMode>> {
