@@ -46,6 +46,7 @@ changelog entry.
 - On Wayland, use the touch serial for `Window::drag_window`, `Window::drag_resize_window` and `Window::show_window_menu` when the interaction was started by touch.
 - On Windows, fix a crash when moving a window that owns windows not created by winit, such as native dialogs or application helper windows.
 - On X11, reset the drag and drop state when a drag operation ends. A later drag no longer reuses the state of a previous drag.
+- On Windows, report the current video mode's refresh rate with millihertz precision (e.g. 59.94 Hz instead of 60 Hz) by using `QueryDisplayConfig`.
 
 ### Changed
 
