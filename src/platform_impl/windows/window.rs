@@ -212,6 +212,9 @@ impl Window {
 
     #[inline]
     pub fn inner_size(&self) -> PhysicalSize<u32> {
+        if let Some(size) = self.window_state_lock().pending_inner_size {
+            return size;
+        }
         let mut rect: RECT = unsafe { mem::zeroed() };
         if unsafe { GetClientRect(self.hwnd(), &mut rect) } == false.into() {
             panic!(

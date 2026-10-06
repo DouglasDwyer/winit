@@ -158,6 +158,14 @@ pub enum WindowEvent {
     ActivationTokenDone { serial: AsyncRequestSerial, token: ActivationToken },
 
     /// The size of the window has changed. Contains the client area's new dimensions.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **Windows:** Emitted while the system is still processing the resize (from
+    ///   `WM_NCCALCSIZE`), before the window has its new size. Only [`Window::inner_size`] is up
+    ///   to date at that point. An application that renders and presents a frame of the new size
+    ///   directly from this event, instead of waiting for [`WindowEvent::RedrawRequested`], avoids
+    ///   a stale, stretched frame during live resizing.
     Resized(PhysicalSize<u32>),
 
     /// The position of the window has changed. Contains the window's new position.

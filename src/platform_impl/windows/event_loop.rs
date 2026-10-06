@@ -132,6 +132,36 @@ impl WindowData {
     fn window_state_lock(&self) -> MutexGuard<'_, WindowState> {
         self.window_state.lock().unwrap()
     }
+
+    /// Reports the new client size from inside `WM_NCCALCSIZE`, ahead of `WM_SIZE`.
+    fn client_size_calculated(&self, window: HWND, client: &RECT) {
+        let width = client.right.saturating_sub(client.left);
+        let height = client.bottom.saturating_sub(client.top);
+        // Ignore empty sizes and minimized windows.
+        if width <= 0 || height <= 0 || util::is_minimized(window) {
+            return;
+        }
+        let size = PhysicalSize::new(width as u32, height as u32);
+
+        {
+            let mut state = self.window_state_lock();
+            if state.last_resized == Some(size) {
+                // Not a size change (e.g. a move).
+                return;
+            }
+            // Makes `WM_SIZE` skip this size.
+            state.last_resized = Some(size);
+            // `GetClientRect` still returns the old size during the events below.
+            state.pending_inner_size = Some(size);
+        }
+
+        self.send_event(Event::WindowEvent {
+            window_id: RootWindowId(WindowId(window)),
+            event: WindowEvent::Resized(size),
+        });
+
+        self.window_state_lock().pending_inner_size = None;
+    }
 }
 
 struct ThreadMsgTargetData {
@@ -1161,8 +1191,17 @@ unsafe fn public_window_callback_inner(
     let callback = || match msg {
         WM_NCCALCSIZE => {
             let window_flags = userdata.window_state_lock().window_flags;
-            if wparam == 0 || window_flags.contains(WindowFlags::MARKER_DECORATIONS) {
+            if wparam == 0 {
                 result = ProcResult::DefWindowProc(wparam);
+                return;
+            }
+
+            if window_flags.contains(WindowFlags::MARKER_DECORATIONS) {
+                // The system writes the new client rectangle into `rgrc[0]`.
+                let res = unsafe { DefWindowProcW(window, msg, wparam, lparam) };
+                let params = unsafe { &*(lparam as *const NCCALCSIZE_PARAMS) };
+                userdata.client_size_calculated(window, &params.rgrc[0]);
+                result = ProcResult::Value(res);
                 return;
             }
 
@@ -1195,6 +1234,7 @@ unsafe fn public_window_callback_inner(
                 params.rgrc[0].bottom += 1;
             }
 
+            userdata.client_size_calculated(window, &params.rgrc[0]);
             result = ProcResult::Value(0);
         },
 
@@ -1405,8 +1445,11 @@ unsafe fn public_window_callback_inner(
                 event: Resized(physical_size),
             };
 
+            let already_reported;
             {
                 let mut w = userdata.window_state_lock();
+                already_reported = w.last_resized == Some(physical_size);
+                w.last_resized = Some(physical_size);
                 // See WindowFlags::MARKER_RETAIN_STATE_ON_SIZE docs for info on why this `if` check
                 // exists.
                 if !w.window_flags().contains(WindowFlags::MARKER_RETAIN_STATE_ON_SIZE) {
@@ -1414,7 +1457,9 @@ unsafe fn public_window_callback_inner(
                     w.set_window_flags_in_place(|f| f.set(WindowFlags::MAXIMIZED, maximized));
                 }
             }
-            userdata.send_event(event);
+            if !already_reported {
+                userdata.send_event(event);
+            }
             result = ProcResult::Value(0);
         },
 

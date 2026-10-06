@@ -53,6 +53,14 @@ pub(crate) struct WindowState {
     // Flag whether redraw was requested.
     pub redraw_requested: bool,
 
+    /// The client size last reported through `WindowEvent::Resized`. Used to report each size only
+    /// once, since it is reported from `WM_NCCALCSIZE` and would otherwise be reported again from
+    /// `WM_SIZE`.
+    pub last_resized: Option<PhysicalSize<u32>>,
+    /// The new client size while it is being reported from `WM_NCCALCSIZE`, at which point
+    /// `GetClientRect` still returns the old size.
+    pub pending_inner_size: Option<PhysicalSize<u32>>,
+
     pub dragging: bool,
 
     pub skip_taskbar: bool,
@@ -173,6 +181,8 @@ impl WindowState {
             is_active: false,
             is_focused: false,
             redraw_requested: false,
+            last_resized: None,
+            pending_inner_size: None,
 
             dragging: false,
 

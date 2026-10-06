@@ -39,3 +39,9 @@ The migration guide could reference other migration examples in the current
 changelog entry.
 
 ## Unreleased
+
+### Fixed
+
+- On Windows, emit `WindowEvent::Resized` from `WM_NCCALCSIZE` instead of `WM_SIZE`. The
+  compositor shows a frame presented from this event together with the new window rectangle, which
+  allows flicker-free live resizing; frames presented later are shown stretched for a moment.
